@@ -386,6 +386,9 @@ body{font-family:var(--f-body);font-size:15px;line-height:1.45}
 #toast{position:fixed;left:16px;right:16px;bottom:calc(88px + env(safe-area-inset-bottom,0px));max-width:528px;margin:0 auto}
 #modal{position:fixed}
 #loading{position:fixed;inset:0;display:grid;place-items:center;background:rgba(0,0,0,.18);z-index:60}
+#loading{align-content:center;gap:12px}
+#loading-msg{margin:0;background:var(--surface,#fff);color:var(--ink,#17140F);padding:8px 14px;border-radius:10px;font-size:14px;font-weight:600;text-align:center;max-width:80vw}
+#loading-msg:empty{display:none}
 .spin{width:38px;height:38px;border:4px solid var(--line);border-top-color:var(--orange);border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 .reader{border-radius:14px;overflow:hidden;background:#0E0D0C;min-height:220px}
@@ -409,7 +412,7 @@ body{font-family:var(--f-body);font-size:15px;line-height:1.45}
 <body>
 <div id="app"></div>
 <div id="toast" role="status" aria-live="polite"></div>
-<div id="loading" hidden><div class="spin"></div></div>
+<div id="loading" hidden><div class="spin"></div><p id="loading-msg"></p></div>
 <div id="modal" hidden>
   <div class="mbar"><span id="modal-n"></span><button class="btn" data-act="close-modal">Cerrar</button></div>
   <img id="modal-img" alt="Foto del mantenimiento">
@@ -458,21 +461,45 @@ const isAdmin = () => rol() === 'admin', isGestor = () => rol() === 'gestor';
 
 /* ---------- servidor ---------- */
 let loadT;
-function loading(on) { clearTimeout(loadT); if (on) loadT = setTimeout(() => $('#loading').hidden = false, 250); else $('#loading').hidden = true; }
+function loading(on, msg) { clearTimeout(loadT); const m = $('#loading-msg'); if (m) m.textContent = msg || ''; if (on) loadT = setTimeout(() => $('#loading').hidden = false, msg ? 0 : 250); else $('#loading').hidden = true; }
+const dormir = ms => new Promise(r => setTimeout(r, ms));
+/* Acciones que se pueden repetir sin riesgo de registrar dos veces (invGuardar lo controla el servidor) */
+const REPETIBLES = new Set(['cambro', 'login', 'ubicaciones', 'empresas', 'panel', 'mantenimientos', 'qrs', 'jornadaDetalle', 'invInicio', 'invFaltan', 'invGuardar']);
+const ESPERAS = [2500, 5000, 9000];
 async function api(action, data = {}, quiet) {
   if (!quiet) loading(true);
   try {
-    const r = await fetch(API_URL, { method: 'POST', body: JSON.stringify(Object.assign({ action, token: S.session?.token }, data)) });
-    const j = await r.json();
-    if (!j.ok) {
+    for (let n = 0; ; n++) {
+      let j = null, red = false, rara = false;
+      try {
+        const r = await fetch(API_URL, { method: 'POST', body: JSON.stringify(Object.assign({ action, token: S.session?.token }, data)) });
+        try { j = await r.json(); } catch (x) { rara = true; }
+      } catch (x) { red = true; }
+      if (j && j.ok) return j;
+      const ocupado = !!j && j.error === 'OCUPADO';
+      const repetir = ocupado || ((red || rara) && REPETIBLES.has(action));
+      if (repetir && n < ESPERAS.length) {
+        if (!quiet) loading(true, red ? 'Sin conexión. Reintentando…' : 'El sistema está ocupado. Reintentando…');
+        await dormir(ESPERAS[n]); continue;
+      }
+      const guardado = action === 'invGuardar' ? ' Lo escaneado no se pierde: vuelve a tocar Guardar.' : '';
+      if (red) throw new Error('No hay conexión con el servidor. Revisa tu internet e inténtalo de nuevo.' + guardado);
+      if (ocupado || rara) throw new Error('El sistema está muy ocupado. Espera un momento y vuelve a intentar.' + guardado);
       if (j.error === 'SESION_VENCIDA') { setSession(null); throw new Error('Tu sesión venció. Inicia sesión de nuevo.'); }
       throw new Error(j.error || 'Algo salió mal.');
     }
-    return j;
-  } catch (e) {
-    if (e instanceof TypeError) throw new Error('No hay conexión con el servidor. Revisa tu internet e inténtalo de nuevo.');
-    throw e;
   } finally { if (!quiet) loading(false); }
+}
+/* Copia del inventario en el celular: si se cierra la app, la lista no se pierde */
+const INV_KEY = 'cambros_inventario';
+function guardarInv() { try { S.inv ? localStorage.setItem(INV_KEY, JSON.stringify(S.inv)) : localStorage.removeItem(INV_KEY); } catch (e) {} }
+function invPendiente() {
+  try {
+    const v = JSON.parse(localStorage.getItem(INV_KEY) || 'null');
+    if (!v || !v.items || !v.items.length) return null;
+    if (Date.now() - (v.creado || 0) > 5.5 * 3600e3) { localStorage.removeItem(INV_KEY); return null; }
+    return v;
+  } catch (e) { return null; }
 }
 async function loadCambro() { S.cam = await api('cambro', { c: S.c, k: S.k }); return S.cam; }
 async function ensureUbics() { if (!S.ubics) S.ubics = await api('ubicaciones'); return S.ubics; }
@@ -590,6 +617,11 @@ function alertActions(a, p) {
   return h ? `<div class="alact">${h}</div>` : '';
 }
 
+function pendienteHTML() {
+  const v = !S.inv && invPendiente(); if (!v) return '';
+  return `<div class="warnbox"><b>Tienes un inventario sin guardar</b><span class="small">${esc(v.ubic)} · ${v.items.length} cambro${v.items.length === 1 ? '' : 's'} escaneado${v.items.length === 1 ? '' : 's'} desde las ${esc(v.inicio)}.</span>
+    <div class="g2" style="margin-top:6px"><button class="btn ghost" data-act="inv-discard">${S.params.dOk ? 'Toca otra vez para borrarlo' : 'Descartar'}</button><button class="btn pri" data-act="inv-resume">Continuar</button></div></div>`;
+}
 const SCREENS = {
   cargando() { return { title: 'Cambros', hideBack: true, body: `<div class="center"><div class="spin"></div><p>Cargando…</p></div>` }; },
   noqr() { return { title: 'Cambros', hideBack: true, body: `<div class="center"><div class="bigicon">${ICON.qr}</div><h2>Escanea el QR de un cambro</h2><p>Esta app solo se abre desde el código pegado en cada cambro. Usa la cámara de tu celular.</p>${credit()}</div>` }; },
@@ -600,6 +632,7 @@ const SCREENS = {
     const c = S.cam;
     return { title: 'Cambros', body: `
       <div style="display:flex;flex-direction:column;gap:8px"><span class="eyebrow">Escaneaste</span>${plate(c, true)}<div>${condPill(c.cond)}</div></div>
+      ${pendienteHTML()}
       <span class="eyebrow" style="margin-top:6px">¿Qué quieres hacer?</span>
       <button class="choice" data-act="hoja"><span class="ci">${ICON.doc}</span><span><b>Hoja de vida</b><small>Condición, ubicación e historial de mantenimientos</small></span><span class="arr">${ICON.arr}</span></button>
       <button class="choice alt" data-act="inv-choose"><span class="ci">${ICON.scan}</span><span><b>Toma de inventario</b><small>Para el personal del colegio. Pide PIN.</small></span><span class="arr">${ICON.arr}</span></button>
@@ -932,7 +965,7 @@ function onScan(text) {
   let c, k; try { const u = new URL(text); c = u.searchParams.get('c'); k = u.searchParams.get('k'); } catch (e) {}
   if (!c || !k) { toast('Ese QR no es de un cambro', 'warn'); return; }
   if (S.inv.items.some(i => String(i.c) === String(c))) { toast(`CAM-${String(c).padStart(5, '0')} ya está en la lista`, 'warn'); return; }
-  S.inv.items.push({ c, k, hora: nowHM(true) });
+  S.inv.items.push({ c, k, hora: nowHM(true) }); guardarInv();
   if (navigator.vibrate) try { navigator.vibrate(60); } catch (e) {}
   $('#scan-n').textContent = S.inv.items.length; $('#scan-list').innerHTML = scanList();
   toast(`CAM-${String(c).padStart(5, '0')} agregado`);
@@ -946,7 +979,9 @@ document.addEventListener('click', async e => {
   try {
     switch (a) {
       case 'back': back(); break;
-      case 'home': S.inv = null; reset('inicio'); break;
+      case 'home': S.inv = null; guardarInv(); reset('inicio'); break;
+      case 'inv-resume': { const v = invPendiente(); if (!v) { toast('Ese inventario ya se venció', 'warn'); render(); break; } S.inv = v; S.hist = []; S.screen = 'inv-scan'; S.params = {}; render(true); toast('Puedes seguir escaneando'); break; }
+      case 'inv-discard': if (!S.params.dOk) { S.params = { ...S.params, dOk: true }; render(); } else { try { localStorage.removeItem(INV_KEY); } catch (x) {} S.params = {}; render(); toast('Inventario descartado'); } break;
       case 'reintentar': boot(); break;
       case 'hoja': go('hoja'); break;
       case 'login': go('login'); break;
@@ -990,7 +1025,7 @@ document.addEventListener('click', async e => {
       case 'inv-start': await ensureUbics(); go('inv-start', { mode: d.mode }); break;
       case 'inv-cancel': $('#cancel-box').hidden = false; break;
       case 'inv-cancel-no': $('#cancel-box').hidden = true; break;
-      case 'inv-cancel-yes': S.inv = null; toast('Cancelado'); reset('inicio'); break;
+      case 'inv-cancel-yes': S.inv = null; guardarInv(); toast('Cancelado'); reset('inicio'); break;
       case 'inv-finish':
         if (!S.inv.items.length) { toast('Escanea al menos un cambro', 'warn'); break; }
         if (S.inv.modo === 'encontrado') { await saveToma(); break; }
@@ -1007,7 +1042,7 @@ function showGal() { const g = S.gal; $('#modal-img').src = foto(g.fotos[g.i], 2
 async function saveToma() {
   await stopCam();
   const r = await api('invGuardar', { inv: S.inv.inv, items: S.inv.items, obs: ($('#i-obs')?.value || '').trim() });
-  S.inv = null; S.hist = []; S.screen = 'inv-ok'; S.params = { res: r }; render(true);
+  S.inv = null; guardarInv(); S.hist = []; S.screen = 'inv-ok'; S.params = { res: r }; render(true);
 }
 
 document.addEventListener('input', e => {
@@ -1089,7 +1124,7 @@ document.addEventListener('submit', async e => {
       const k = $('#i-col-val').value, nom = $('#i-nom').value.trim(), pin = $('#i-pin').value.trim();
       if (!k) return err('err-inv', 'Busca y escoge tu colegio.'); if (nom.length < 3) return err('err-inv', 'Escribe tu nombre.');
       const r = await api('invInicio', { c: S.c, k: S.k, modo: S.params.mode, llave: k, nombre: nom, pin });
-      S.inv = { inv: r.inv, ubic: r.ubic, inicio: r.inicio, modo: S.params.mode, items: [{ c: S.c, k: S.k, hora: nowHM(true) }] };
+      S.inv = { inv: r.inv, ubic: r.ubic, inicio: r.inicio, modo: S.params.mode, creado: Date.now(), items: [{ c: S.c, k: S.k, hora: nowHM(true) }] }; guardarInv();
       S.hist = []; S.screen = 'inv-scan'; S.params = {}; render(true);
     }
   } catch (x) {
